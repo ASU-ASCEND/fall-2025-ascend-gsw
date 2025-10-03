@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 
+.cursor/
+*.db
+
 # Virtual environments
 .venv
 

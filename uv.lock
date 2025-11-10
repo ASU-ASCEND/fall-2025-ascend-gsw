@@ -94,6 +94,7 @@ dependencies = [
     { name = "construct" },
     { name = "fastapi", extra = ["standard"] },
     { name = "hypercorn" },
+    { name = "lorarf" },
     { name = "peewee" },
     { name = "pydantic" },
     { name = "pyserial" },
@@ -108,6 +109,7 @@ requires-dist = [
     { name = "construct", specifier = ">=2.10.70" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.116.2" },
     { name = "hypercorn", specifier = ">=0.17.3" },
+    { name = "lorarf", specifier = ">=1.4.0" },
     { name = "peewee", specifier = ">=3.18.2" },
     { name = "pydantic", specifier = ">=2.11.9" },
     { name = "pyserial", specifier = ">=3.5" },
@@ -312,6 +314,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
+]
+
+[[package]]
+name = "lorarf"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rpi-gpio" },
+    { name = "spidev" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/20/0c/8d68be030540edeada07a19dd653ea6874eefedea7084f770f83fb9cdd87/LoRaRF-1.4.0.tar.gz", hash = "sha256:ac28e7d5adebfc176b7d9d0cf70a0ad8627f589c3f808664d2fce2c64f0ac9b5", size = 22412, upload-time = "2022-09-25T07:42:06.3Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/23/1baf7097c6a60e73b366b3770e50795847acea555548fb877831a4fc29e6/LoRaRF-1.4.0-py3-none-any.whl", hash = "sha256:8c2a918dacbdd255cefca61a91af5518e9997128083f7015114139ea14bc3c96", size = 23309, upload-time = "2022-09-25T07:42:04.36Z" },
 ]
 
 [[package]]
@@ -620,6 +635,12 @@ wheels = [
 ]
 
 [[package]]
+name = "rpi-gpio"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c4/0f/10b524a12b3445af1c607c27b2f5ed122ef55756e29942900e5c950735f2/RPi.GPIO-0.7.1.tar.gz", hash = "sha256:cd61c4b03c37b62bba4a5acfea9862749c33c618e0295e7e90aa4713fb373b70", size = 29090, upload-time = "2022-02-06T15:15:06.022Z" }
+
+[[package]]
 name = "sentry-sdk"
 version = "2.38.0"
 source = { registry = "https://pypi.org/simple" }
@@ -649,6 +670,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
 ]
+
+[[package]]
+name = "spidev"
+version = "3.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/67/87/039b6eeea781598015b538691bc174cc0bf77df9d4d2d3b8bf9245c0de8c/spidev-3.8.tar.gz", hash = "sha256:2bc02fb8c6312d519ebf1f4331067427c0921d3f77b8bcaf05189a2e8b8382c0", size = 13893, upload-time = "2025-09-15T18:56:20.672Z" }
 
 [[package]]
 name = "sse-starlette"

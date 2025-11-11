@@ -5,15 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "construct>=2.10.70",
     "fastapi[standard]>=0.116.2",
     "hypercorn>=0.17.3",
     "lorarf>=1.4.0",
     "peewee>=3.18.2",
     "pydantic>=2.11.9",
-    "pyserial>=3.5",
-    "pytest>=8.4.2",
     "sse-starlette",
     "starlette",
-    "uvicorn",
 ]

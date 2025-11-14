@@ -11,7 +11,6 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_HOST, UDP_PORT))
 
 print(f"Listening for UDP messages on {UDP_HOST}:{UDP_PORT}...")
-print("Press Ctrl+C to stop\n")
 
 try:
     while True:

@@ -1,6 +1,7 @@
 import asyncio
+import logging
 import os
-import time
+import socket
 from datetime import datetime
 from typing import Optional
 
@@ -9,8 +10,14 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.cors import CORSMiddleware
 
+from src.config import UDP_HOST, UDP_PORT
+from src.decoder import parse_packet
 from src.schema import FlightTelemetry as FlightTelemetryModel
-from src.schema import db
+from src.schema import db, init_database
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class FlightTelemetry(BaseModel):
@@ -79,116 +86,138 @@ class FlightTelemetry(BaseModel):
 
 app = FastAPI()
 
-# Add CORS middleware
+# Add CORS middleware - allow all origins for Pi hotspot clients
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],  # Allow all origins for Pi hotspot access
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global state for SSE timing
-telemetry_data = []
-start_time = None
-data_lock = asyncio.Lock()
+# Global state for SSE
+telemetry_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+socket_task: Optional[asyncio.Task] = None
+sock: Optional[socket.socket] = None
 
 
-async def load_telemetry_data():
-    """Load telemetry data from database and sort by millis"""
-    global telemetry_data
-    if not telemetry_data:
-        db.connect()
-        query = FlightTelemetryModel.select().order_by(FlightTelemetryModel.millis)
-        telemetry_data = list(query)
-        db.close()
-    return telemetry_data
+def _recv_udp_packet(sock: socket.socket) -> tuple[bytes, tuple]:
+    """Blocking UDP receive - called from thread."""
+    return sock.recvfrom(1024)
 
 
-async def get_telemetry_generator():
-    """Generator function for SSE events"""
-    global start_time
+async def socket_listener():
+    """Background task to listen for UDP packets, decode them, and store in database."""
+    global sock
 
-    # Load data if not already loaded
-    data = await load_telemetry_data()
-    if not data:
-        yield {"event": "error", "data": "No telemetry data available"}
-        return
+    # Create UDP socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((UDP_HOST, UDP_PORT))
+    sock.settimeout(1.0)  # Timeout to allow periodic checks
 
-    # Set start time on first connection
-    async with data_lock:
-        if start_time is None:
-            start_time = time.time()
-
-    # Get the start time for this session
-    session_start = start_time
-
-    # Find the earliest millis value to use as our reference point
-    earliest_millis = data[0].millis if data else 0
-
-    # Track which events we've sent
-    sent_events = set()
+    logger.info(f"Socket listener started on {UDP_HOST}:{UDP_PORT}")
 
     while True:
         try:
-            # Calculate elapsed time since first connection (in milliseconds)
-            current_time = time.time()
-            elapsed_ms = int((current_time - session_start) * 1000)
-            current_millis = earliest_millis + elapsed_ms
+            # Use asyncio.to_thread for blocking socket operation
+            data, addr = await asyncio.to_thread(_recv_udp_packet, sock)
+            logger.debug(f"Received {len(data)} bytes from {addr}")
 
-            # Check for events that should be sent now
-            events_to_send = []
-            for record in data:
-                record_millis = record.millis
-                record_id = record.id
+            # Decode the packet
+            try:
+                decoded = parse_packet(data)
+                logger.info(f"Decoded packet with millis: {decoded.get('millis')}")
 
-                # Send event if it's time and we haven't sent it yet
-                if record_millis <= current_millis and record_id not in sent_events:
-                    events_to_send.append(record)
-                    sent_events.add(record_id)
+                # Store in database
+                try:
+                    # Create database record with raw bytes and decoded values
+                    # Filter decoded dict to only include fields that exist in the model
+                    model_fields = set(FlightTelemetryModel._meta.fields.keys())
+                    filtered_decoded = {
+                        k: v for k, v in decoded.items() if k in model_fields
+                    }
+                    record_dict = {"raw_bytes": data, **filtered_decoded}
+                    FlightTelemetryModel.create(**record_dict)
+                    logger.debug(
+                        f"Stored telemetry record with millis: {decoded.get('millis')}"
+                    )
 
-            # Send events
-            for record in events_to_send:
-                # Log the millisecond timestamp for each event
-                print(f"Sent telemetry event at millis: {record.millis}")
+                    # Push decoded data to queue for SSE broadcasting
+                    # Convert to Pydantic model for consistency
+                    telemetry_event = FlightTelemetry(**decoded)
+                    try:
+                        await telemetry_queue.put(telemetry_event)
+                    except asyncio.QueueFull:
+                        logger.warning("Telemetry queue is full, dropping oldest event")
+                        # Remove oldest and add new
+                        try:
+                            await asyncio.wait_for(telemetry_queue.get(), timeout=0.1)
+                            await telemetry_queue.put(telemetry_event)
+                        except asyncio.TimeoutError:
+                            logger.error("Could not make room in queue, dropping event")
 
-                # Convert Peewee model to Pydantic model for proper JSON serialization
-                record_dict = record.__data__
-                # Handle None values and empty strings for optional fields
-                cleaned_dict = {}
-                for key, value in record_dict.items():
-                    if value is None or value == "" or value == 0:
-                        # Convert empty strings and 0 values to None for optional fields
-                        cleaned_dict[key] = None
-                    else:
-                        cleaned_dict[key] = value
+                except Exception as db_error:
+                    logger.error(f"Database error: {db_error}", exc_info=True)
 
-                telemetry_event = FlightTelemetry(**cleaned_dict)
-                yield {
-                    "event": "telemetry",
-                    "data": telemetry_event.model_dump_json(),
-                    "id": str(record.id),
-                    "retry": 1000,
-                }
+            except Exception as decode_error:
+                logger.warning(f"Failed to decode packet: {decode_error}")
+                # Still store raw bytes even if decode fails
+                try:
+                    FlightTelemetryModel.create(
+                        raw_bytes=data,
+                        millis=0,  # Default millis if decode fails
+                    )
+                except Exception as db_error:
+                    logger.error(f"Failed to store raw bytes: {db_error}")
 
-            # Check if we've sent all events
-            if len(sent_events) >= len(data):
-                # All events sent, send completion event
-                yield {
-                    "event": "complete",
-                    "data": "All telemetry events sent",
-                    "id": "complete",
-                    "retry": 1000,
-                }
-                break
-
-            # Wait a bit before checking again (10ms precision)
-            await asyncio.sleep(0.01)
-
+        except (socket.timeout, TimeoutError):
+            # Timeout is expected, continue listening
+            continue
         except asyncio.CancelledError:
+            logger.info("Socket listener cancelled")
             break
         except Exception as e:
-            yield {"event": "error", "data": f"Error: {str(e)}", "retry": 1000}
+            logger.error(f"Unexpected error in socket listener: {e}", exc_info=True)
+            await asyncio.sleep(1)  # Brief pause before retrying
+
+
+async def get_telemetry_generator():
+    """Generator function for SSE events - streams real-time telemetry from queue."""
+    logger.info("SSE client connected")
+
+    while True:
+        try:
+            # Wait for telemetry data from queue with timeout
+            try:
+                telemetry_event = await asyncio.wait_for(
+                    telemetry_queue.get(), timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                # Send keepalive to prevent connection timeout
+                yield {
+                    "event": "ping",
+                    "data": "keepalive",
+                    "retry": 1000,
+                }
+                continue
+
+            # Send telemetry event
+            yield {
+                "event": "telemetry",
+                "data": telemetry_event.model_dump_json(),
+                "retry": 1000,
+            }
+
+        except asyncio.CancelledError:
+            logger.info("SSE client disconnected")
+            break
+        except Exception as e:
+            logger.error(f"Error in SSE generator: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": f"Error: {str(e)}",
+                "retry": 1000,
+            }
             break
 
 
@@ -210,3 +239,50 @@ def health_check():
 async def telemetry_events():
     """SSE endpoint for telemetry events"""
     return EventSourceResponse(get_telemetry_generator())
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database and start socket listener on startup."""
+    global socket_task
+
+    logger.info("Starting up FastAPI application...")
+
+    # Initialize database
+    try:
+        init_database()
+        logger.info("Database initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}", exc_info=True)
+        raise
+
+    # Start socket listener as background task
+    socket_task = asyncio.create_task(socket_listener())
+    logger.info("Socket listener task started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown."""
+    global socket_task, sock
+
+    logger.info("Shutting down FastAPI application...")
+
+    # Cancel socket listener task
+    if socket_task:
+        socket_task.cancel()
+        try:
+            await socket_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Socket listener task cancelled")
+
+    # Close socket
+    if sock:
+        sock.close()
+        logger.info("Socket closed")
+
+    # Close database connection
+    if not db.is_closed():
+        db.close()
+        logger.info("Database connection closed")

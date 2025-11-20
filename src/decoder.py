@@ -20,18 +20,18 @@ MIN_PACKET_SIZE = (
 
 
 # Sensor metadata: (bit_index, field_names, data_types, struct_format)
-# data_types: 'f' for float, 'I' for uint32, 'i' for int32
+# data_types: 'f' for float, 'd' for double, 'H' for uint16_t, 'B' for uint8_t, 'h' for int16_t, 'I' for uint32_t, 'i' for int32_t
 SENSOR_METADATA = [
-    # 0: ina260_sensor
+    # 0: INA260
     (
         0,
         ["ina260_current_ma", "ina260_voltage_mv", "ina260_power_mw"],
         ["f", "f", "f"],
         "fff",
     ),
-    # 1: temp_sensor/picotemp
+    # 1: PicoTemp
     (1, ["picotemp_temp_c"], ["f"], "f"),
-    # 2: gps_sensor/mtk3339
+    # 2: MTK3339
     (
         2,
         [
@@ -48,10 +48,10 @@ SENSOR_METADATA = [
             "mtk3339_altitude",
             "mtk3339_satellites",
         ],
-        ["I", "I", "I", "I", "I", "I", "f", "f", "f", "f", "f", "I"],
-        "IIIIIIfffffI",
+        ["H", "B", "B", "B", "B", "B", "f", "f", "f", "f", "f", "B"],
+        "HBBBBBfffffB",
     ),
-    # 3: icm_sensor/icm20948
+    # 3: ICM20948
     (
         3,
         [
@@ -69,7 +69,7 @@ SENSOR_METADATA = [
         ["f", "f", "f", "f", "f", "f", "f", "f", "f", "f"],
         "ffffffffff",
     ),
-    # 4: rtc_sensor/pcf8523
+    # 4: PCF8523
     (
         4,
         [
@@ -80,33 +80,35 @@ SENSOR_METADATA = [
             "pcf8523_minute",
             "pcf8523_second",
         ],
-        ["I", "I", "I", "I", "I", "I"],
-        "IIIIII",
+        ["H", "B", "B", "B", "B", "B"],
+        "HBBBBB",
     ),
-    # 5: tmp_sensor/tmp117
+    # 5: TMP117
     (5, ["tmp117_temp_c"], ["f"], "f"),
-    # 6: uv_sensor_out
+    # 6: UV_Sensor_O
     (
         6,
         ["uv_sensor_uva2_nm", "uv_sensor_uvb2_nm", "uv_sensor_uvc2_nm"],
         ["f", "f", "f"],
         "fff",
     ),
-    # 7: ens160_sensor_out
-    (7, ["ens160_aqi", "ens160_tvoc_ppb", "ens160_eco2_ppm"], ["I", "f", "f"], "Iff"),
-    # 8: bmp_sensor_out/bmp390
+    # 7: ENS160_O
+    (7, ["ens160_aqi", "ens160_tvoc_ppb", "ens160_eco2_ppm"], ["B", "H", "H"], "BHH"),
+    # 8: BMP390_O
     (
         8,
-        ["bmp390_pressure_pa", "bmp390_altitude_m", "bmp390_temp_c"],
-        ["f", "f", "f"],
-        "fff",
+        ["bmp390_temp_c", "bmp390_pressure_pa", "bmp390_altitude_m"],
+        ["d", "d", "f"],
+        "ddf",
     ),
-    # 9: tmp_sensor_out
+    # 9: TMP117_O
     (9, ["tmp117_o_temp_o_c"], ["f"], "f"),
-    # 10: shtc3_sensor_out
+    # 10: SHTC3_O
     (10, ["shtc3_o_temp_o_c", "shtc3_o_rel_hum_o"], ["f", "f"], "ff"),
-    # 11: ozone_sensor_out
-    (11, ["ozone_conc_ppb"], ["f"], "f"),
+    # 11: Ozone
+    (11, ["ozone_conc_ppb"], ["h"], "h"),
+    # 12: Analog_Temp_0
+    (12, ["analog_temp_0_adc_val"], ["i"], "i"),
 ]
 
 
@@ -149,23 +151,34 @@ def decode_sensor_data(
     data_offset += 4
 
     # Iterate through sensors in order
-    # Try 1-based indexing first (bit 1 = sensor 0, bit 2 = sensor 1, etc.)
-    # This matches the documentation where bit 0 was reserved for header
-    for sensor_index, (_, field_names, data_types, struct_fmt) in enumerate(
+    # Bit indices are 0-based (bit 0, 1, 2, etc.)
+    for sensor_index, (bit_index, field_names, data_types, struct_fmt) in enumerate(
         SENSOR_METADATA
     ):
-        # Check if this sensor is present (bit sensor_index + 1 is set)
-        bit_position = sensor_index + 1
-        if presence_bits & (1 << bit_position):
+        # Check if this sensor is present (use bit_index from metadata)
+        if presence_bits & (1 << bit_index):
             # Calculate total bytes needed for this sensor
-            total_bytes = sum(4 if dt in ["f", "I", "i"] else 2 for dt in data_types)
+            # 'B' = uint8_t (1 byte), 'H'/'h' = uint16_t/int16_t (2 bytes),
+            # 'f'/'I'/'i' = float/uint32_t/int32_t (4 bytes), 'd' = double (8 bytes)
+            total_bytes = sum(
+                1
+                if dt == "B"
+                else 2
+                if dt in ["H", "h"]
+                else 4
+                if dt in ["f", "I", "i"]
+                else 8
+                if dt == "d"
+                else 4  # default to 4 bytes
+                for dt in data_types
+            )
 
             # Check if we have enough data (excluding checksum)
             # If not, skip this sensor (might be a bit set incorrectly or reserved)
             if data_offset + total_bytes > data_end:
                 # Log warning but don't fail - some bits might be reserved or set incorrectly
                 logger.warning(
-                    f"Sensor {sensor_index} (bit {bit_position}) marked present but insufficient data: "
+                    f"Sensor {sensor_index} (bit {bit_index}) marked present but insufficient data: "
                     f"need {total_bytes} bytes, have {data_end - data_offset} bytes remaining. Skipping."
                 )
                 continue

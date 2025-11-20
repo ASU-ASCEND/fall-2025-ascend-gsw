@@ -33,13 +33,13 @@ uv run hypercorn -c hypercorn_config.toml src.main:app
 **Test SSE endpoint with HTTP/2:**
 
 ```bash
-curl -N --http2 http://localhost:8000/telemetry-events
+curl -N --http2 http://localhost:1338/telemetry-events
 ```
 
 **Test SSE endpoint with regular HTTP/1.1:**
 
 ```bash
-curl -N http://localhost:8000/telemetry-events
+curl -N http://localhost:1338/telemetry-events
 ```
 
 ### Architecture
@@ -47,4 +47,4 @@ curl -N http://localhost:8000/telemetry-events
 - **UDP Socket Listener**: Listens on `localhost:1337` for raw bytes from the radio interface
 - **Decoder**: Decodes incoming packets using the packet parser
 - **Database**: Stores raw bytes and decoded telemetry in SQLite (`data/sqlite3.db`)
-- **SSE Server**: Broadcasts decoded telemetry in real-time via Server-Sent Events on port `8000`
+- **SSE Server**: Broadcasts decoded telemetry in real-time via Server-Sent Events on port `1338`

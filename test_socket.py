@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Test script to send example bytes from output.txt to the UDP socket."""
 
-import ast
 import socket
 import time
 from pathlib import Path
@@ -84,4 +83,3 @@ else:
     print("\n⚠️  No new records were created. Make sure the FastAPI server is running!")
 
 db.close()
-

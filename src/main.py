@@ -11,7 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from src.config import UDP_HOST, UDP_PORT
-from src.decoder import parse_packet
+from src.decoder import parse_packet, validate_checksum
 from src.schema import FlightTelemetry as FlightTelemetryModel
 from src.schema import db, init_database
 
@@ -79,6 +79,7 @@ class FlightTelemetry(BaseModel):
     ens160_o_aqi_o: Optional[int] = None
     ens160_o_tvoc_o_ppb: Optional[float] = None
     ens160_o_eco2_o_ppm: Optional[float] = None
+    analog_temp_0_adc_val: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -125,9 +126,23 @@ async def socket_listener():
             # Decode the packet
             try:
                 decoded = parse_packet(data)
-                logger.info(f"Decoded packet with millis: {decoded.get('millis')}")
 
-                # Store in database
+                # Validate checksum before processing
+                checksum_position = len(data) - 1
+                checksum_valid = validate_checksum(data, checksum_position)
+
+                if not checksum_valid:
+                    logger.warning(
+                        f"Checksum validation failed for packet with millis={decoded.get('millis', 'unknown')}. "
+                        "Skipping SSE broadcast but storing in database for analysis."
+                    )
+
+                logger.info(
+                    f"Decoded packet with millis: {decoded.get('millis')} "
+                    f"(checksum: {'VALID' if checksum_valid else 'INVALID'})"
+                )
+
+                # Store in database (even if checksum fails, for debugging/analysis)
                 try:
                     # Create database record with raw bytes and decoded values
                     # Filter decoded dict to only include fields that exist in the model
@@ -141,19 +156,28 @@ async def socket_listener():
                         f"Stored telemetry record with millis: {decoded.get('millis')}"
                     )
 
-                    # Push decoded data to queue for SSE broadcasting
-                    # Convert to Pydantic model for consistency
-                    telemetry_event = FlightTelemetry(**decoded)
-                    try:
-                        await telemetry_queue.put(telemetry_event)
-                    except asyncio.QueueFull:
-                        logger.warning("Telemetry queue is full, dropping oldest event")
-                        # Remove oldest and add new
+                    # Only push to SSE queue if checksum is valid
+                    if checksum_valid:
+                        # Convert to Pydantic model for consistency
+                        telemetry_event = FlightTelemetry(**decoded)
                         try:
-                            await asyncio.wait_for(telemetry_queue.get(), timeout=0.1)
                             await telemetry_queue.put(telemetry_event)
-                        except asyncio.TimeoutError:
-                            logger.error("Could not make room in queue, dropping event")
+                        except asyncio.QueueFull:
+                            logger.warning(
+                                "Telemetry queue is full, dropping oldest event"
+                            )
+                            # Remove oldest and add new
+                            try:
+                                await asyncio.wait_for(
+                                    telemetry_queue.get(), timeout=0.1
+                                )
+                                await telemetry_queue.put(telemetry_event)
+                            except asyncio.TimeoutError:
+                                logger.error(
+                                    "Could not make room in queue, dropping event"
+                                )
+                    else:
+                        logger.debug("Skipping SSE broadcast due to invalid checksum")
 
                 except Exception as db_error:
                     logger.error(f"Database error: {db_error}", exc_info=True)

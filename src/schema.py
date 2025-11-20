@@ -76,6 +76,7 @@ class FlightTelemetry(BaseModel):
     ens160_o_aqi_o = IntegerField(null=True)
     ens160_o_tvoc_o_ppb = FloatField(null=True)
     ens160_o_eco2_o_ppm = FloatField(null=True)
+    analog_temp_0_adc_val = IntegerField(null=True)
 
 
 def init_database():

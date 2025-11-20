@@ -197,16 +197,27 @@ def decode_sensor_data(
     return decoded, data_offset
 
 
-def validate_checksum(data: bytes, data_end: int) -> bool:
-    """Validate packet checksum. Returns True if valid, False otherwise."""
-    if data_end >= len(data):
+def validate_checksum(data: bytes, checksum_position: int) -> bool:
+    """
+    Validate packet checksum using two's complement algorithm.
+
+    The checksum is calculated as: (256 - sum(all_bytes_except_checksum)) & 0xFF
+    This ensures that sum(all_bytes_including_checksum) & 0xFF == 0
+
+    Args:
+        data: Complete packet bytes
+        checksum_position: Position of checksum byte (typically len(data) - 1)
+
+    Returns:
+        True if checksum is valid, False otherwise
+    """
+    if checksum_position >= len(data):
         return False
 
-    # Simple checksum: sum of all bytes except the checksum byte itself
-    # This is a common simple checksum algorithm
-    checksum_byte = data[data_end]
-    calculated_sum = sum(data[:data_end]) & 0xFF
-    return calculated_sum == checksum_byte
+    checksum_byte = data[checksum_position]
+    sum_bytes = sum(data[:checksum_position]) & 0xFF
+    calculated_checksum = (256 - sum_bytes) & 0xFF
+    return calculated_checksum == checksum_byte
 
 
 def create_telemetry_dict(decoded: Dict[str, any]) -> Dict[str, any]:
@@ -232,12 +243,14 @@ def parse_packet(data: bytes) -> Dict[str, any]:
     """
     Parse a binary sensor packet and return a dictionary compatible with FlightTelemetry.
 
-    Packet structure:
-    - Sync bytes (4 bytes): "ASU!"
-    - Sensor presence (4 bytes): 32-bit bitfield
-    - Packet length (2 bytes): Total packet size
-    - Data section: Binary-packed sensor values
-    - Checksum (1 byte): Error detection
+    Packet structure (per ASCEND Flight Software Packet Definition):
+    - ID/Sync bytes (4 bytes): "ASU!" - predefined identifier bytes
+    - Sensor presence (4 bytes): 32-bit bitfield indicating which sensors are present
+    - Packet length (2 bytes): Total packet size as unsigned integer
+    - Data section: Binary-packed sensor values (Millis first, then sensors in order)
+    - Checksum (1 byte): Two's complement checksum for error detection
+
+    Reference: https://asu-ascend.github.io/Spring-2025/md__2home_2runner_2work_2Spring-2025_2Spring-2025_2docs__src_2Packet__Definition.html
 
     Returns:
         Dictionary with decoded sensor data, compatible with FlightTelemetry model.
@@ -268,8 +281,9 @@ def parse_packet(data: bytes) -> Dict[str, any]:
     # Decode sensor data
     decoded, data_end = decode_sensor_data(data, offset, presence_bits)
 
-    # Validate checksum (optional, but we'll do it)
-    if not validate_checksum(data, data_end):
+    # Validate checksum (checksum is at the last byte of the packet)
+    checksum_position = len(data) - 1
+    if not validate_checksum(data, checksum_position):
         # Log warning but don't fail - checksum validation is optional for now
         logger.warning(
             f"Checksum validation failed for packet with millis={decoded.get('millis', 'unknown')}"

@@ -1,10 +1,8 @@
 import asyncio
 import logging
 import os
-import signal
 import socket
 import sys
-import traceback
 from datetime import datetime
 from typing import Optional
 
@@ -34,52 +32,12 @@ def handle_exception(loop, context):
     """Handle uncaught exceptions in asyncio event loop."""
     exception = context.get("exception")
     if exception:
-        logger.critical(
-            f"Uncaught exception in event loop: {exception}",
-            exc_info=exception,
-            extra={"exception": exception, "context": context},
-        )
-        # Also log the traceback to stderr for journalctl
-        print(
-            f"CRITICAL: Uncaught exception in event loop: {exception}",
-            file=sys.stderr,
-        )
-        traceback.print_exception(
-            type(exception), exception, exception.__traceback__, file=sys.stderr
+        logger.error(
+            f"Uncaught exception in event loop: {exception}", exc_info=exception
         )
     else:
-        # Handle other errors (like Task exception was never retrieved)
         error_msg = context.get("message", "Unknown error")
-        logger.error(
-            f"Event loop error: {error_msg}",
-            extra={"context": context},
-        )
-        print(f"ERROR: Event loop error: {error_msg}", file=sys.stderr)
-        print(f"Context: {context}", file=sys.stderr)
-
-
-# Set up uncaught exception handler for main thread
-def handle_unhandled_exception(exc_type, exc_value, exc_traceback):
-    """Handle uncaught exceptions in main thread."""
-    if issubclass(exc_type, KeyboardInterrupt):
-        # Allow keyboard interrupts to propagate normally
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-
-    logger.critical(
-        f"Uncaught exception: {exc_type.__name__}: {exc_value}",
-        exc_info=(exc_type, exc_value, exc_traceback),
-    )
-    # Also log to stderr with full traceback for journalctl
-    print(
-        f"CRITICAL: Uncaught exception {exc_type.__name__}: {exc_value}",
-        file=sys.stderr,
-    )
-    traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
-
-
-# Install exception handlers
-sys.excepthook = handle_unhandled_exception
+        logger.error(f"Event loop error: {error_msg}")
 
 
 class FlightTelemetry(BaseModel):
@@ -206,108 +164,92 @@ async def socket_listener():
     """Background task to listen for UDP packets, decode them, and store in database."""
     global sock
 
+    # Create UDP socket with SO_REUSEADDR for cleaner restarts
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((UDP_HOST, UDP_PORT))
+    sock.settimeout(1.0)  # Timeout to allow periodic checks for cancellation
+    logger.info(f"Socket listener started on {UDP_HOST}:{UDP_PORT}")
+
     try:
-        # Create UDP socket with SO_REUSEADDR for cleaner restarts
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((UDP_HOST, UDP_PORT))
-        sock.settimeout(1.0)  # Timeout to allow periodic checks
-
-        logger.info(f"Socket listener started on {UDP_HOST}:{UDP_PORT}")
-    except Exception as e:
-        logger.critical(f"Failed to initialize socket listener: {e}", exc_info=True)
-        raise
-
-    while True:
-        try:
-            # Use asyncio.to_thread for blocking socket operation
-            data, addr = await asyncio.to_thread(_recv_udp_packet, sock)
-            logger.debug(f"Received {len(data)} bytes from {addr}")
-
-            # Decode the packet
+        while True:
             try:
-                decoded = parse_packet(data)
+                # Use asyncio.to_thread for blocking socket operation
+                data, addr = await asyncio.to_thread(_recv_udp_packet, sock)
+                logger.debug(f"Received {len(data)} bytes from {addr}")
 
-                # Validate checksum before processing
-                checksum_position = len(data) - 1
-                checksum_valid = validate_checksum(data, checksum_position)
-
-                if not checksum_valid:
-                    logger.warning(
-                        f"Checksum validation failed for packet with millis={decoded.get('millis', 'unknown')}. "
-                        "Skipping SSE broadcast but storing in database for analysis."
-                    )
-
-                logger.info(
-                    f"Decoded packet with millis: {decoded.get('millis')} "
-                    f"(checksum: {'VALID' if checksum_valid else 'INVALID'})"
-                )
-
-                # Store in database (even if checksum fails, for debugging/analysis)
+                # Decode the packet
                 try:
-                    # Create database record with raw bytes and decoded values
-                    # Filter decoded dict to only include fields that exist in the model
-                    model_fields = set(FlightTelemetryModel._meta.fields.keys())
-                    filtered_decoded = {
-                        k: v for k, v in decoded.items() if k in model_fields
-                    }
-                    record_dict = {"raw_bytes": data, **filtered_decoded}
-                    # Run database operation in thread to avoid blocking event loop
-                    await asyncio.to_thread(_create_db_record, record_dict)
-                    logger.debug(
-                        f"Stored telemetry record with millis: {decoded.get('millis')}"
+                    decoded = parse_packet(data)
+                    checksum_position = len(data) - 1
+                    checksum_valid = validate_checksum(data, checksum_position)
+
+                    if not checksum_valid:
+                        logger.warning(
+                            f"Checksum validation failed for packet with millis={decoded.get('millis', 'unknown')}. "
+                            "Skipping SSE broadcast but storing in database for analysis."
+                        )
+
+                    logger.info(
+                        f"Decoded packet with millis: {decoded.get('millis')} "
+                        f"(checksum: {'VALID' if checksum_valid else 'INVALID'})"
                     )
 
-                    # Only push to SSE queue if checksum is valid
-                    if checksum_valid:
-                        # Convert to Pydantic model for consistency
-                        telemetry_event = FlightTelemetry(**decoded)
-                        try:
-                            await telemetry_queue.put(telemetry_event)
-                        except asyncio.QueueFull:
-                            logger.warning(
-                                "Telemetry queue is full, dropping oldest event"
-                            )
-                            # Remove oldest and add new
+                    # Store in database
+                    try:
+                        model_fields = set(FlightTelemetryModel._meta.fields.keys())
+                        filtered_decoded = {
+                            k: v for k, v in decoded.items() if k in model_fields
+                        }
+                        record_dict = {"raw_bytes": data, **filtered_decoded}
+                        await asyncio.to_thread(_create_db_record, record_dict)
+
+                        # Only push to SSE queue if checksum is valid
+                        if checksum_valid:
+                            telemetry_event = FlightTelemetry(**decoded)
                             try:
-                                await asyncio.wait_for(
-                                    telemetry_queue.get(), timeout=0.1
-                                )
                                 await telemetry_queue.put(telemetry_event)
-                            except asyncio.TimeoutError:
-                                logger.error(
-                                    "Could not make room in queue, dropping event"
-                                )
-                    else:
-                        logger.debug("Skipping SSE broadcast due to invalid checksum")
+                            except asyncio.QueueFull:
+                                # Remove oldest and add new
+                                try:
+                                    await asyncio.wait_for(
+                                        telemetry_queue.get(), timeout=0.1
+                                    )
+                                    await telemetry_queue.put(telemetry_event)
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "Could not make room in queue, dropping event"
+                                    )
+                    except Exception as db_error:
+                        logger.error(f"Database error: {db_error}", exc_info=True)
 
-                except Exception as db_error:
-                    logger.error(f"Database error: {db_error}", exc_info=True)
+                except Exception as decode_error:
+                    logger.warning(f"Failed to decode packet: {decode_error}")
+                    # Still store raw bytes even if decode fails
+                    try:
+                        record_dict = {"raw_bytes": data, "millis": 0}
+                        await asyncio.to_thread(_create_db_record, record_dict)
+                    except Exception as db_error:
+                        logger.error(
+                            f"Failed to store raw bytes: {db_error}", exc_info=True
+                        )
 
-            except Exception as decode_error:
-                logger.warning(f"Failed to decode packet: {decode_error}")
-                # Still store raw bytes even if decode fails
-                try:
-                    record_dict = {
-                        "raw_bytes": data,
-                        "millis": 0,  # Default millis if decode fails
-                    }
-                    # Run database operation in thread to avoid blocking event loop
-                    await asyncio.to_thread(_create_db_record, record_dict)
-                except Exception as db_error:
-                    logger.error(
-                        f"Failed to store raw bytes: {db_error}", exc_info=True
-                    )
+            except (socket.timeout, TimeoutError):
+                # Timeout is expected, continue listening
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error in socket listener: {e}", exc_info=True)
+                await asyncio.sleep(1)
 
-        except (socket.timeout, TimeoutError):
-            # Timeout is expected, continue listening
-            continue
-        except asyncio.CancelledError:
-            logger.info("Socket listener cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Unexpected error in socket listener: {e}", exc_info=True)
-            await asyncio.sleep(1)  # Brief pause before retrying
+    except asyncio.CancelledError:
+        logger.info("Socket listener cancelled")
+    finally:
+        if sock:
+            try:
+                sock.close()
+                logger.info("Socket closed")
+            except Exception as e:
+                logger.error(f"Error closing socket: {e}", exc_info=True)
 
 
 async def get_telemetry_generator():
@@ -407,16 +349,11 @@ async def startup_event():
 
     logger.info("Starting up FastAPI application...")
 
-    # Setup signal handlers (do this in startup to avoid issues during import)
-    setup_signal_handlers()
-
     # Set exception handler for this event loop
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(handle_exception)
 
-    logger.info("Exception handlers configured")
-
-    # Initialize database in thread to avoid blocking
+    # Initialize database
     try:
         await asyncio.to_thread(init_database)
         logger.info("Database initialized")
@@ -424,22 +361,17 @@ async def startup_event():
         logger.critical(f"Failed to initialize database: {e}", exc_info=True)
         raise
 
-    # Start socket listener as background task with proper error handling
-    try:
-        socket_task = asyncio.create_task(socket_listener())
-        # Add done callback to log if task crashes
-        socket_task.add_done_callback(
-            lambda task: logger.error(
-                f"Socket listener task ended unexpectedly: {task.exception()}",
-                exc_info=task.exception(),
-            )
-            if task.exception()
-            else None
+    # Start socket listener as background task
+    socket_task = asyncio.create_task(socket_listener())
+    socket_task.add_done_callback(
+        lambda task: logger.error(
+            f"Socket listener task ended unexpectedly: {task.exception()}",
+            exc_info=task.exception(),
         )
-        logger.info("Socket listener task started")
-    except Exception as e:
-        logger.critical(f"Failed to start socket listener task: {e}", exc_info=True)
-        raise
+        if task.exception()
+        else None
+    )
+    logger.info("Socket listener task started")
 
 
 @app.on_event("shutdown")
@@ -450,17 +382,17 @@ async def shutdown_event():
     logger.info("Shutting down FastAPI application...")
 
     # Cancel socket listener task
-    if socket_task:
+    if socket_task and not socket_task.done():
+        logger.info("Cancelling socket listener task...")
         socket_task.cancel()
         try:
-            await socket_task
+            await asyncio.wait_for(socket_task, timeout=5.0)
         except asyncio.CancelledError:
             pass
+        except asyncio.TimeoutError:
+            logger.warning("Socket task did not cancel within timeout")
         except Exception as e:
-            logger.error(
-                f"Error waiting for socket task cancellation: {e}", exc_info=True
-            )
-        logger.info("Socket listener task cancelled")
+            logger.error(f"Error cancelling socket task: {e}", exc_info=True)
 
     # Close socket
     if sock:
@@ -477,29 +409,3 @@ async def shutdown_event():
             logger.info("Database connection closed")
     except Exception as e:
         logger.error(f"Error closing database: {e}", exc_info=True)
-
-
-# Add signal handlers for graceful shutdown
-def setup_signal_handlers():
-    """Setup signal handlers for graceful shutdown."""
-
-    def signal_handler(signum, frame):
-        signal_name = signal.Signals(signum).name
-        logger.info(
-            f"Received signal {signum} ({signal_name}), initiating graceful shutdown..."
-        )
-        # The shutdown will be handled by the application lifecycle
-        # Log to stderr for journalctl
-        print(
-            f"INFO: Received signal {signum} ({signal_name}), initiating graceful shutdown...",
-            file=sys.stderr,
-        )
-
-    try:
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-        logger.info("Signal handlers registered")
-    except (ValueError, OSError) as e:
-        # Some signals might not be available in all environments
-        logger.warning(f"Could not register all signal handlers: {e}")

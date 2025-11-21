@@ -1,0 +1,28 @@
+
+Nov 20 16:56:18 raspberrypi uv[1249]:     ~~~~~~~~~^^^^^^^^^
+Nov 20 16:56:18 raspberrypi uv[1249]: OSError: [Errno 98] Address already in use
+Nov 20 16:56:18 raspberrypi systemd[1]: gsw.service: Main process exited, code=exited, status=1/FAILURE
+Nov 20 16:56:18 raspberrypi systemd[1]: gsw.service: Failed with result 'exit-code'.
+Nov 20 16:56:18 raspberrypi systemd[1]: gsw.service: Consumed 1.468s CPU time.
+^[[ANov 20 16:56:20 raspberrypi systemd[1]: gsw.service: Scheduled restart job, restart counter is at 46.
+Nov 20 16:56:20 raspberrypi systemd[1]: Started gsw.service - Fast API SSE Server.
+Nov 20 16:56:21 raspberrypi uv[1254]: Traceback (most recent call last):
+Nov 20 16:56:21 raspberrypi uv[1254]:   File "/home/gse/gsw/.venv/bin/hypercorn", line 10, in <module>
+Nov 20 16:56:21 raspberrypi uv[1254]:     sys.exit(main())
+Nov 20 16:56:21 raspberrypi uv[1254]:              ~~~~^^
+Nov 20 16:56:21 raspberrypi uv[1254]:   File "/home/gse/gsw/.venv/lib/python3.13/site-packages/hypercorn/__main__.py", line 304, in main
+Nov 20 16:56:21 raspberrypi uv[1254]:     return run(config)
+Nov 20 16:56:21 raspberrypi uv[1254]:   File "/home/gse/gsw/.venv/lib/python3.13/site-packages/hypercorn/run.py", line 39, in run
+Nov 20 16:56:21 raspberrypi uv[1254]:     sockets = config.create_sockets()
+Nov 20 16:56:21 raspberrypi uv[1254]:   File "/home/gse/gsw/.venv/lib/python3.13/site-packages/hypercorn/config.py", line 206, in create_sockets
+Nov 20 16:56:21 raspberrypi uv[1254]:     insecure_sockets = self._create_sockets(self.bind)
+Nov 20 16:56:21 raspberrypi uv[1254]:   File "/home/gse/gsw/.venv/lib/python3.13/site-packages/hypercorn/config.py", line 273, in _create_sockets
+Nov 20 16:56:21 raspberrypi uv[1254]:     sock.bind(binding)
+Nov 20 16:56:21 raspberrypi uv[1254]:     ~~~~~~~~~^^^^^^^^^
+Nov 20 16:56:21 raspberrypi uv[1254]: OSError: [Errno 98] Address already in use
+Nov 20 16:56:22 raspberrypi systemd[1]: gsw.service: Main process exited, code=exited, status=1/FAILURE
+Nov 20 16:56:22 raspberrypi systemd[1]: gsw.service: Failed with result 'exit-code'.
+Nov 20 16:56:22 raspberrypi systemd[1]: gsw.service: Consumed 1.458s CPU time.
+Nov 20 16:56:24 raspberrypi systemd[1]: gsw.service: Scheduled restart job, restart counter is at 47.
+Nov 20 16:56:24 raspberrypi systemd[1]: Started gsw.service - Fast API SSE Server.
+

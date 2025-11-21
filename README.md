@@ -24,7 +24,7 @@ The server automatically:
 
 - Initializes the database connection
 - Starts the UDP socket listener on `localhost:1337` to receive packets from the radio interface
-- Starts the FastAPI server on port `8000` with SSE endpoint
+- Starts the FastAPI server on port `1338` with SSE endpoint
 
 ```bash
 uv run hypercorn -c hypercorn_config.toml src.main:app

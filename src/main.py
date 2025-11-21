@@ -1,11 +1,15 @@
 import asyncio
 import logging
 import os
+import signal
 import socket
+import sys
+import traceback
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.cors import CORSMiddleware
@@ -15,9 +19,67 @@ from src.decoder import parse_packet, validate_checksum
 from src.schema import FlightTelemetry as FlightTelemetryModel
 from src.schema import db, init_database
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging to output to stderr (captured by systemd/journalctl)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,  # Output to stderr for journalctl
+)
 logger = logging.getLogger(__name__)
+
+
+# Set up uncaught exception handler for async tasks
+def handle_exception(loop, context):
+    """Handle uncaught exceptions in asyncio event loop."""
+    exception = context.get("exception")
+    if exception:
+        logger.critical(
+            f"Uncaught exception in event loop: {exception}",
+            exc_info=exception,
+            extra={"exception": exception, "context": context},
+        )
+        # Also log the traceback to stderr for journalctl
+        print(
+            f"CRITICAL: Uncaught exception in event loop: {exception}",
+            file=sys.stderr,
+        )
+        traceback.print_exception(
+            type(exception), exception, exception.__traceback__, file=sys.stderr
+        )
+    else:
+        # Handle other errors (like Task exception was never retrieved)
+        error_msg = context.get("message", "Unknown error")
+        logger.error(
+            f"Event loop error: {error_msg}",
+            extra={"context": context},
+        )
+        print(f"ERROR: Event loop error: {error_msg}", file=sys.stderr)
+        print(f"Context: {context}", file=sys.stderr)
+
+
+# Set up uncaught exception handler for main thread
+def handle_unhandled_exception(exc_type, exc_value, exc_traceback):
+    """Handle uncaught exceptions in main thread."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Allow keyboard interrupts to propagate normally
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    logger.critical(
+        f"Uncaught exception: {exc_type.__name__}: {exc_value}",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+    # Also log to stderr with full traceback for journalctl
+    print(
+        f"CRITICAL: Uncaught exception {exc_type.__name__}: {exc_value}",
+        file=sys.stderr,
+    )
+    traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+
+
+# Install exception handlers
+sys.excepthook = handle_unhandled_exception
 
 
 class FlightTelemetry(BaseModel):
@@ -87,6 +149,30 @@ class FlightTelemetry(BaseModel):
 
 app = FastAPI()
 
+
+# Add exception handler middleware to catch all exceptions
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler to log all unhandled exceptions."""
+    logger.error(
+        f"Unhandled exception in {request.method} {request.url}: {exc}",
+        exc_info=exc,
+        extra={
+            "path": str(request.url),
+            "method": request.method,
+            "exception_type": type(exc).__name__,
+        },
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "type": type(exc).__name__,
+            "detail": str(exc),
+        },
+    )
+
+
 # Add CORS middleware - allow all origins for Pi hotspot clients
 app.add_middleware(
     CORSMiddleware,
@@ -96,7 +182,8 @@ app.add_middleware(
 )
 
 # Global state for SSE
-telemetry_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+# Reduced queue size for Pi Zero 2 W memory constraints
+telemetry_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 socket_task: Optional[asyncio.Task] = None
 sock: Optional[socket.socket] = None
 
@@ -106,16 +193,30 @@ def _recv_udp_packet(sock: socket.socket) -> tuple[bytes, tuple]:
     return sock.recvfrom(1024)
 
 
+def _create_db_record(record_dict: dict) -> None:
+    """Blocking database create operation - called from thread."""
+    try:
+        FlightTelemetryModel.create(**record_dict)
+    except Exception as e:
+        # Re-raise so it can be caught by the caller
+        raise e
+
+
 async def socket_listener():
     """Background task to listen for UDP packets, decode them, and store in database."""
     global sock
 
-    # Create UDP socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((UDP_HOST, UDP_PORT))
-    sock.settimeout(1.0)  # Timeout to allow periodic checks
+    try:
+        # Create UDP socket with SO_REUSEADDR for cleaner restarts
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((UDP_HOST, UDP_PORT))
+        sock.settimeout(1.0)  # Timeout to allow periodic checks
 
-    logger.info(f"Socket listener started on {UDP_HOST}:{UDP_PORT}")
+        logger.info(f"Socket listener started on {UDP_HOST}:{UDP_PORT}")
+    except Exception as e:
+        logger.critical(f"Failed to initialize socket listener: {e}", exc_info=True)
+        raise
 
     while True:
         try:
@@ -151,7 +252,8 @@ async def socket_listener():
                         k: v for k, v in decoded.items() if k in model_fields
                     }
                     record_dict = {"raw_bytes": data, **filtered_decoded}
-                    FlightTelemetryModel.create(**record_dict)
+                    # Run database operation in thread to avoid blocking event loop
+                    await asyncio.to_thread(_create_db_record, record_dict)
                     logger.debug(
                         f"Stored telemetry record with millis: {decoded.get('millis')}"
                     )
@@ -186,12 +288,16 @@ async def socket_listener():
                 logger.warning(f"Failed to decode packet: {decode_error}")
                 # Still store raw bytes even if decode fails
                 try:
-                    FlightTelemetryModel.create(
-                        raw_bytes=data,
-                        millis=0,  # Default millis if decode fails
-                    )
+                    record_dict = {
+                        "raw_bytes": data,
+                        "millis": 0,  # Default millis if decode fails
+                    }
+                    # Run database operation in thread to avoid blocking event loop
+                    await asyncio.to_thread(_create_db_record, record_dict)
                 except Exception as db_error:
-                    logger.error(f"Failed to store raw bytes: {db_error}")
+                    logger.error(
+                        f"Failed to store raw bytes: {db_error}", exc_info=True
+                    )
 
         except (socket.timeout, TimeoutError):
             # Timeout is expected, continue listening
@@ -206,42 +312,67 @@ async def socket_listener():
 
 async def get_telemetry_generator():
     """Generator function for SSE events - streams real-time telemetry from queue."""
-    logger.info("SSE client connected")
+    connection_id = id(asyncio.current_task())
+    logger.info(f"SSE client connected (connection_id={connection_id})")
 
-    while True:
-        try:
-            # Wait for telemetry data from queue with timeout
+    try:
+        while True:
             try:
-                telemetry_event = await asyncio.wait_for(
-                    telemetry_queue.get(), timeout=30.0
+                # Wait for telemetry data from queue with timeout
+                try:
+                    telemetry_event = await asyncio.wait_for(
+                        telemetry_queue.get(), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    # Send keepalive to prevent connection timeout
+                    yield {
+                        "event": "ping",
+                        "data": "keepalive",
+                        "retry": 1000,
+                    }
+                    continue
+
+                # Send telemetry event
+                try:
+                    yield {
+                        "event": "telemetry",
+                        "data": telemetry_event.model_dump_json(),
+                        "retry": 1000,
+                    }
+                except Exception as send_error:
+                    # Client likely disconnected - break the loop
+                    logger.info(
+                        f"Error sending to SSE client (connection_id={connection_id}): {send_error}"
+                    )
+                    break
+
+            except asyncio.CancelledError:
+                logger.info(f"SSE client disconnected (connection_id={connection_id})")
+                break
+            except GeneratorExit:
+                # Client disconnected - this is expected
+                logger.info(
+                    f"SSE client disconnected via GeneratorExit (connection_id={connection_id})"
                 )
-            except asyncio.TimeoutError:
-                # Send keepalive to prevent connection timeout
-                yield {
-                    "event": "ping",
-                    "data": "keepalive",
-                    "retry": 1000,
-                }
-                continue
+                break
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error in SSE generator (connection_id={connection_id}): {e}",
+                    exc_info=True,
+                )
+                try:
+                    yield {
+                        "event": "error",
+                        "data": f"Error: {str(e)}",
+                        "retry": 1000,
+                    }
+                except Exception:
+                    # Can't send error - client likely disconnected
+                    pass
+                break
 
-            # Send telemetry event
-            yield {
-                "event": "telemetry",
-                "data": telemetry_event.model_dump_json(),
-                "retry": 1000,
-            }
-
-        except asyncio.CancelledError:
-            logger.info("SSE client disconnected")
-            break
-        except Exception as e:
-            logger.error(f"Error in SSE generator: {e}", exc_info=True)
-            yield {
-                "event": "error",
-                "data": f"Error: {str(e)}",
-                "retry": 1000,
-            }
-            break
+    finally:
+        logger.info(f"SSE generator cleaned up (connection_id={connection_id})")
 
 
 @app.get("/")
@@ -261,7 +392,12 @@ def health_check():
 @app.get("/telemetry-events")
 async def telemetry_events():
     """SSE endpoint for telemetry events"""
-    return EventSourceResponse(get_telemetry_generator())
+    try:
+        response = EventSourceResponse(get_telemetry_generator())
+        return response
+    except Exception as e:
+        logger.error(f"Error creating SSE response: {e}", exc_info=True)
+        raise
 
 
 @app.on_event("startup")
@@ -271,17 +407,39 @@ async def startup_event():
 
     logger.info("Starting up FastAPI application...")
 
-    # Initialize database
+    # Setup signal handlers (do this in startup to avoid issues during import)
+    setup_signal_handlers()
+
+    # Set exception handler for this event loop
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(handle_exception)
+
+    logger.info("Exception handlers configured")
+
+    # Initialize database in thread to avoid blocking
     try:
-        init_database()
+        await asyncio.to_thread(init_database)
         logger.info("Database initialized")
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}", exc_info=True)
+        logger.critical(f"Failed to initialize database: {e}", exc_info=True)
         raise
 
-    # Start socket listener as background task
-    socket_task = asyncio.create_task(socket_listener())
-    logger.info("Socket listener task started")
+    # Start socket listener as background task with proper error handling
+    try:
+        socket_task = asyncio.create_task(socket_listener())
+        # Add done callback to log if task crashes
+        socket_task.add_done_callback(
+            lambda task: logger.error(
+                f"Socket listener task ended unexpectedly: {task.exception()}",
+                exc_info=task.exception(),
+            )
+            if task.exception()
+            else None
+        )
+        logger.info("Socket listener task started")
+    except Exception as e:
+        logger.critical(f"Failed to start socket listener task: {e}", exc_info=True)
+        raise
 
 
 @app.on_event("shutdown")
@@ -298,14 +456,50 @@ async def shutdown_event():
             await socket_task
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            logger.error(
+                f"Error waiting for socket task cancellation: {e}", exc_info=True
+            )
         logger.info("Socket listener task cancelled")
 
     # Close socket
     if sock:
-        sock.close()
-        logger.info("Socket closed")
+        try:
+            sock.close()
+            logger.info("Socket closed")
+        except Exception as e:
+            logger.error(f"Error closing socket: {e}", exc_info=True)
 
     # Close database connection
-    if not db.is_closed():
-        db.close()
-        logger.info("Database connection closed")
+    try:
+        if not db.is_closed():
+            await asyncio.to_thread(db.close)
+            logger.info("Database connection closed")
+    except Exception as e:
+        logger.error(f"Error closing database: {e}", exc_info=True)
+
+
+# Add signal handlers for graceful shutdown
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown."""
+
+    def signal_handler(signum, frame):
+        signal_name = signal.Signals(signum).name
+        logger.info(
+            f"Received signal {signum} ({signal_name}), initiating graceful shutdown..."
+        )
+        # The shutdown will be handled by the application lifecycle
+        # Log to stderr for journalctl
+        print(
+            f"INFO: Received signal {signum} ({signal_name}), initiating graceful shutdown...",
+            file=sys.stderr,
+        )
+
+    try:
+        # Register signal handlers
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        logger.info("Signal handlers registered")
+    except (ValueError, OSError) as e:
+        # Some signals might not be available in all environments
+        logger.warning(f"Could not register all signal handlers: {e}")

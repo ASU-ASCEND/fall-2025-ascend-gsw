@@ -133,6 +133,34 @@ def parse_packet_length(data: bytes, offset: int) -> Tuple[int, int]:
     return length, offset + PACKET_LENGTH_LEN
 
 
+def _presence_flags_from_header(presence_bits: int) -> Tuple[bool, ...]:
+    """
+    Convert the sensor presence header to a tuple of booleans in sensor order.
+
+    The flight software sets the header by starting with 0b1, then for each sensor
+    shifting left and OR-ing 1 when that sensor's data is appended (see packet spec
+    at https://asu-ascend.github.io/Spring-2025/md__2home_2runner_2work_2Spring-2025_2Spring-2025_2docs__src_2Packet__Definition.html).
+    As a result the most-significant bit is a sentinel and the remaining bits map to
+    sensors in ascending order.
+    """
+    total_sensors = len(SENSOR_METADATA)
+    # +1 to account for sentinel bit, pad with zeros so we always have enough bits
+    bit_string = format(presence_bits, f"0{total_sensors + 1}b")
+    # If the value overflowed the expected width, keep the least-significant bits
+    if len(bit_string) > total_sensors + 1:
+        bit_string = bit_string[-(total_sensors + 1) :]
+
+    sentinel_bit = bit_string[0]
+    if sentinel_bit != "1":
+        logger.warning(
+            "Sensor presence sentinel bit not set. "
+            f"Header bits: {bit_string}. Proceeding with padded value."
+        )
+
+    sensor_bits = bit_string[1:]
+    return tuple(bit == "1" for bit in sensor_bits)
+
+
 def decode_sensor_data(
     data: bytes, offset: int, presence_bits: int
 ) -> Tuple[Dict[str, any], int]:
@@ -150,13 +178,15 @@ def decode_sensor_data(
     decoded["millis"] = millis
     data_offset += 4
 
-    # Iterate through sensors in order
-    # Bit indices are 0-based (bit 0, 1, 2, etc.)
-    for sensor_index, (bit_index, field_names, data_types, struct_fmt) in enumerate(
-        SENSOR_METADATA
-    ):
-        # Check if this sensor is present (use bit_index from metadata)
-        if presence_bits & (1 << bit_index):
+    sensor_flags = _presence_flags_from_header(presence_bits)
+
+    # Iterate through sensors in order while consuming the header bits that
+    # were populated by the flight software shift-register logic.
+    for sensor_index, (
+        sensor_present,
+        (bit_index, field_names, data_types, struct_fmt),
+    ) in enumerate(zip(sensor_flags, SENSOR_METADATA)):
+        if sensor_present:
             # Calculate total bytes needed for this sensor
             # 'B' = uint8_t (1 byte), 'H'/'h' = uint16_t/int16_t (2 bytes),
             # 'f'/'I'/'i' = float/uint32_t/int32_t (4 bytes), 'd' = double (8 bytes)
